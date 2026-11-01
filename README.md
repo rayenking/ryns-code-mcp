@@ -52,6 +52,48 @@ In HTTP mode the server also serves `/assets/` (static files from
 `/api/save/<name>` (used by the bundled sheet viewer). Treat both as public once
 the server is reachable.
 
+## Connecting to Claude, ChatGPT or other remote clients
+
+Clients that run in the cloud (Claude custom connectors, ChatGPT connectors, and
+similar) cannot reach `127.0.0.1` on your machine. They need a public HTTPS URL
+that points at the server's Streamable HTTP endpoint. To get one, run the server
+in HTTP mode and forward the port with a tunnel such as
+[ngrok](https://ngrok.com), [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+(`cloudflared`), or a similar service (Tailscale Funnel, localtunnel, your own
+reverse proxy, ...).
+
+1. Start the server:
+
+   ```bash
+   ./ryns-code-mcp --port 8799
+   ```
+
+2. Forward the port with the tunnel of your choice:
+
+   ```bash
+   # ngrok
+   ngrok http 8799
+
+   # Cloudflare quick tunnel (temporary URL, no account needed)
+   cloudflared tunnel --url http://127.0.0.1:8799
+   ```
+
+   For a stable hostname, use a named Cloudflare tunnel or a reserved ngrok
+   domain instead of a temporary URL.
+
+3. Add the tunnel URL **with `/mcp` at the end** as a remote MCP server /
+   connector in your client, for example `https://your-tunnel.example.com/mcp`.
+
+4. Set `RYNS_PUBLIC_BASE_URL` to the tunnel URL (without `/mcp`) so links
+   returned by `sheet_url` and `record_video` work from outside.
+
+> **Before you do this, protect the URL.** Anyone who has the tunnel URL can use
+> every tool on your machine, because the server does not authenticate requests.
+> Put authentication in front of the tunnel (Cloudflare Access, an
+> authenticating reverse proxy, or your tunnel provider's auth features; check
+> which methods your client supports), do not share the URL, and shut the tunnel
+> down when you are not using it.
+
 ## Configuration
 
 | Variable | Default | Purpose |
