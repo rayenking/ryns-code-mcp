@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Optional local config (gitignored): RYNS_WORKSPACE_ROOT, RYNS_PUBLIC_BASE_URL, ...
+if [[ -f "$ROOT/.env" ]]; then set -a; . "$ROOT/.env"; set +a; fi
+
+DEFAULT_WORKSPACE="${HOME}/RynsWorkspace"
+WORKSPACE="${RYNS_WORKSPACE_ROOT:-$DEFAULT_WORKSPACE}"
+STATE_DIR="$ROOT/.state"
+ENABLED_FILE="$STATE_DIR/enabled"
+PID_FILE="$STATE_DIR/pid"
+STATUS_FILE="$STATE_DIR/status"
+PACKAGE_JSON="$ROOT/package.json"
+ENTRYPOINT="main.go"
+BINARY="$ROOT/.state/ryns-code-mcp"
+
+log() {
+  printf '[ryns-code-mcp] %s\n' "$*" >&2
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./run [options]
+
+Commands:
+  ./run                 Run the existing MCP over stdio (default)
+  ./run --enable        Mark MCP as enabled; do not start a daemon
+  ./run --disable       Mark MCP as disabled and stop a managed process, if any
+  ./run --status        Show enabled state, process state, version and paths
+  ./run --restart       Restart a managed/background process, if one exists
+  ./run --port PORT     Serve MCP over Streamable HTTP on 127.0.0.1:PORT
+                        (for cloudflared tunnel or other HTTP clients);
+                        defaults to stdio
+  ./run --version       Show MCP version from package.json
+  ./run --help          Show this help
+
+Options:
+  --workspace PATH      Workspace root (also supported by RYNS_WORKSPACE_ROOT)
+
+Environment:
+  RYNS_WORKSPACE_ROOT   Override the default workspace:
+                        ~/RynsWorkspace
+
+State:
+  $STATE_DIR
+
+Notes:
+  The default invocation is an MCP stdio server. stdin/stdout are passed
+  directly to the existing MCP entrypoint. Launcher logs go to stderr.
+  The runner does not create a daemon for tunnel-client stdio usage.
+EOF
+}
+
+read_version() {
+  node -e 'const p=require(process.argv[1]); process.stdout.write(String(p.version || "unknown"))' "$PACKAGE_JSON"
+}
+
+pid_is_running() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  # Only consider a PID managed by this runner when its command line still
+  # belongs to this MCP. This prevents killing an unrelated reused PID.
+  local cmd
+  cmd="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  [[ "$cmd" == *"$ROOT/run"* || "$cmd" == *"$ROOT/node_modules"* || "$cmd" == *"$ROOT/src/index.ts"* ]]
+}
+
+managed_pid() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(tr -d '[:space:]' < "$PID_FILE")"
+  pid_is_running "$pid" || return 1
+  printf '%s\n' "$pid"
+}
+
+stop_managed() {
+  local pid
+  if ! pid="$(managed_pid)"; then
+    rm -f "$PID_FILE"
+    return 0
+  fi
+
+  log "stopping managed MCP process (pid $pid)"
+  kill -TERM "$pid" 2>/dev/null || true
+
+  for _ in {1..20}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    log "managed process did not exit after SIGTERM; sending SIGKILL"
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+
+  rm -f "$PID_FILE"
+  printf '%s\n' 'stopped' > "$STATUS_FILE"
+}
+
+start_managed() {
+  # This is intentionally not used by the normal stdio path. A managed PID
+  # exists only when a future/background manager explicitly creates one.
+  # Keeping this helper here makes --restart safe without daemonizing a
+  # tunnel-client-owned stdio server.
+  return 1
+}
+
+mkdir -p "$STATE_DIR"
+
+COMMAND="run"
+WORKSPACE_ARG_SET=false
+PORT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --workspace)
+      [[ $# -ge 2 ]] || { echo "Missing value for --workspace" >&2; exit 2; }
+      WORKSPACE="$2"
+      WORKSPACE_ARG_SET=true
+      shift 2
+      ;;
+    --port)
+      [[ $# -ge 2 ]] || { echo "Missing value for --port" >&2; exit 2; }
+      PORT="$2"
+      shift 2
+      ;;
+    --enable|--disable|--status|--restart|--version|--help)
+      if [[ "$COMMAND" != "run" ]]; then
+        echo "Only one command may be specified" >&2
+        exit 2
+      fi
+      COMMAND="${1#--}"
+      shift
+      ;;
+    -h)
+      COMMAND="help"
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Resolve the workspace to an absolute path without requiring it to exist yet.
+if [[ "$WORKSPACE" != /* ]]; then
+  WORKSPACE="$(cd "$ROOT" && cd "$WORKSPACE" 2>/dev/null && pwd)" || {
+    echo "Invalid workspace: $WORKSPACE" >&2
+    exit 2
+  }
+fi
+
+case "$COMMAND" in
+  enable)
+    printf '%s\n' enabled > "$ENABLED_FILE"
+    printf '%s\n' enabled > "$STATUS_FILE"
+    echo "enabled"
+    echo "workspace: $WORKSPACE"
+    echo "state: $STATE_DIR"
+    ;;
+
+  disable)
+    stop_managed
+    rm -f "$ENABLED_FILE"
+    printf '%s\n' disabled > "$STATUS_FILE"
+    echo "disabled"
+    echo "workspace: $WORKSPACE"
+    ;;
+
+  status)
+    if [[ -f "$ENABLED_FILE" ]]; then
+      enabled_state="enabled"
+    else
+      enabled_state="disabled"
+    fi
+
+    pid=""
+    if pid="$(managed_pid)"; then
+      running_state="running"
+    else
+      running_state="not running"
+      rm -f "$PID_FILE"
+    fi
+
+    version="$(read_version)"
+    echo "enabled: $enabled_state"
+    echo "running: $running_state"
+    if [[ -n "$pid" ]]; then
+      echo "pid: $pid"
+    else
+      echo "pid: -"
+    fi
+    echo "version: $version"
+    echo "workspace: $WORKSPACE"
+    echo "entrypoint: $ROOT/$ENTRYPOINT"
+    ;;
+
+  restart)
+    if managed_pid >/dev/null 2>&1; then
+      stop_managed
+      if start_managed; then
+        echo "restarted"
+      else
+        echo "no managed process was restarted"
+      fi
+    else
+      rm -f "$PID_FILE"
+      echo "no managed process to restart"
+      echo "stdio-owned MCP was not started or duplicated"
+    fi
+    ;;
+
+  version)
+    read_version
+    ;;
+
+  help)
+    usage
+    ;;
+
+  run)
+    cd "$ROOT"
+    export RYNS_WORKSPACE_ROOT="$WORKSPACE"
+    export RYNS_MCP_ENTRYPOINT="$ROOT/$ENTRYPOINT"
+
+    # Do not daemonize, redirect, or wrap stdio. tunnel-client owns this
+    # process and speaks MCP directly over stdin/stdout.
+    # Build once into .state, then exec the native Go binary. This removes the
+    # Node/tsx runtime dependency from the MCP launch path.
+    if [[ ! -x "$BINARY" || "$ROOT/main.go" -nt "$BINARY" || "$ROOT/go.mod" -nt "$BINARY" || ( -f "$ROOT/go.sum" && "$ROOT/go.sum" -nt "$BINARY" ) ]]; then
+      if [[ ! -f "$ROOT/go.sum" ]]; then
+        log "resolving Go module dependencies"
+        go mod tidy
+      fi
+      log "building native Go MCP binary"
+      go build -o "$BINARY" .
+    fi
+    if [[ -n "$PORT" ]]; then
+      log "starting MCP HTTP on 127.0.0.1:$PORT: $BINARY"
+      exec "$BINARY" -port "$PORT"
+    fi
+    log "starting MCP stdio: $BINARY"
+    exec "$BINARY"
+    ;;
+
+  *)
+    echo "Unknown command: $COMMAND" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

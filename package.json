@@ -1,0 +1,23 @@
+{
+  "name": "ryns-code-mcp",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "description": "Coding-agent MCP server for RynsWorkspace: files, search, shell, long-running processes and git.",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx src/index.ts",
+    "inspect": "npx @modelcontextprotocol/inspector tsx src/index.ts"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@modelcontextprotocol/server": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/inspector": "latest",
+    "tsx": "latest",
+    "typescript": "latest",
+    "@types/node": "latest"
+  }
+}

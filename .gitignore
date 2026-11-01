@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+npm-debug.log*
+
+# build output and local runtime state
+/ryns-code-mcp
+/.state/
+/.omo/
+test.txt
