@@ -754,7 +754,7 @@ func startProcess(command, cwd string, interactive bool) (*proc, error) {
 		// programs such as 9router that refuse to render when stdout/stderr
 		// are ordinary pipes. stdin/stdout are still exposed through the MCP
 		// process tools so the caller can interact with the program.
-		cmd = exec.Command("script", "-qefc", command, "/dev/null")
+		cmd = ptyCommand(command)
 	} else {
 		cmd = exec.Command("/bin/bash", "-lc", command)
 	}
@@ -1779,22 +1779,7 @@ func setupTools(server *mcp.Server) {
 		tmp.Close()
 		defer os.Remove(tmpPath)
 
-		args := []string{}
-		if in.Window != "" {
-			args = append(args, "-window", in.Window)
-		} else {
-			args = append(args, "-window", "root")
-		}
-		args = append(args, tmpPath)
-
-		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(cctx, "import", args...)
-		cmd.Env = append(os.Environ(), "DISPLAY=:0")
-		if _, statErr := os.Stat(filepath.Join(os.Getenv("HOME"), ".Xauthority")); statErr == nil {
-			cmd.Env = append(cmd.Env, "XAUTHORITY="+filepath.Join(os.Getenv("HOME"), ".Xauthority"))
-		}
-		out, err := cmd.CombinedOutput()
+		out, err := captureScreen(ctx, in.Window, tmpPath)
 		if err != nil {
 			return textResult(fmt.Sprintf("screenshot_error: %v\n%s", err, string(out)))
 		}
@@ -1827,7 +1812,7 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "clipboard_get", Title: "Clipboard Get", Description: "Read the current text on the X clipboard."}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
-		out, err := runXTool(ctx, 5*time.Second, "xclip", "-selection", "clipboard", "-o")
+		out, err := clipboardRead(ctx)
 		if err != nil {
 			return textResult("(clipboard is empty or unavailable)")
 		}
@@ -1835,12 +1820,7 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "clipboard_set", Title: "Clipboard Set", Description: "Set the X clipboard to the given text."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ClipboardSetInput) (*mcp.CallToolResult, any, error) {
-		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(cctx, "xclip", "-selection", "clipboard")
-		cmd.Env = xEnv()
-		cmd.Stdin = strings.NewReader(in.Text)
-		out, err := cmd.CombinedOutput()
+		out, err := clipboardWrite(ctx, in.Text)
 		if err != nil {
 			return textResult(fmt.Sprintf("clipboard_error: %v\n%s", err, string(out)))
 		}
@@ -1851,6 +1831,13 @@ func setupTools(server *mcp.Server) {
 		button := in.Button
 		if button == 0 {
 			button = 1
+		}
+		if isDarwin {
+			res, err := macMouseClick(ctx, in.X, in.Y, button, in.Double)
+			if err != nil {
+				return textResult(fmt.Sprintf("mouse_click_error: %v", err))
+			}
+			return textResult(res)
 		}
 		args := []string{"mousemove", "--sync", strconv.Itoa(in.X), strconv.Itoa(in.Y), "click"}
 		if in.Double {
@@ -1873,6 +1860,12 @@ func setupTools(server *mcp.Server) {
 		if delay <= 0 {
 			delay = 12
 		}
+		if isDarwin {
+			if out, err := macTypeText(ctx, in.Text); err != nil {
+				return textResult(fmt.Sprintf("keyboard_type_error: %v\n%s", err, string(out)))
+			}
+			return textResult(fmt.Sprintf("typed %d character(s)", len(in.Text)))
+		}
 		out, err := runXTool(ctx, 30*time.Second, "xdotool", "type", "--delay", strconv.Itoa(delay), "--", in.Text)
 		if err != nil {
 			return textResult(fmt.Sprintf("keyboard_type_error: %v\n%s", err, string(out)))
@@ -1881,6 +1874,12 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "key_press", Title: "Key Press", Description: "Send a key or key combo using xdotool key syntax, e.g. 'Return', 'ctrl+c', 'alt+Tab', 'super'."}, func(ctx context.Context, _ *mcp.CallToolRequest, in KeyPressInput) (*mcp.CallToolResult, any, error) {
+		if isDarwin {
+			if err := macPressKeys(ctx, in.Keys); err != nil {
+				return textResult(fmt.Sprintf("key_press_error: %v", err))
+			}
+			return textResult(fmt.Sprintf("sent key(s): %s", in.Keys))
+		}
 		out, err := runXTool(ctx, 5*time.Second, "xdotool", "key", "--", in.Keys)
 		if err != nil {
 			return textResult(fmt.Sprintf("key_press_error: %v\n%s", err, string(out)))
@@ -1889,6 +1888,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "get_active_window", Title: "Get Active Window", Description: "Return the id, title, and window class of the currently focused window."}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		if isDarwin {
+			return textResult(macActiveWindow(ctx))
+		}
 		idOut, err := runXTool(ctx, 5*time.Second, "xdotool", "getactivewindow")
 		if err != nil {
 			return textResult(fmt.Sprintf("get_active_window_error: %v\n%s", err, string(idOut)))
@@ -1900,6 +1902,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "list_windows", Title: "List Windows", Description: "List visible windows with their id and title."}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		if isDarwin {
+			return textResult(macListWindows(ctx))
+		}
 		out, err := runXTool(ctx, 5*time.Second, "xdotool", "search", "--onlyvisible", "--name", ".*")
 		if err != nil {
 			return textResult(fmt.Sprintf("list_windows_error: %v\n%s", err, string(out)))
@@ -1920,6 +1925,12 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "notify_send", Title: "Send Notification", Description: "Show a desktop notification popup."}, func(ctx context.Context, _ *mcp.CallToolRequest, in NotifyInput) (*mcp.CallToolResult, any, error) {
+		if isDarwin {
+			if out, err := macNotify(ctx, in.Title, in.Body); err != nil {
+				return textResult(fmt.Sprintf("notify_error: %v\n%s", err, string(out)))
+			}
+			return textResult("notification sent")
+		}
 		urgency := in.Urgency
 		if urgency == "" {
 			urgency = "normal"
@@ -1944,11 +1955,7 @@ func setupTools(server *mcp.Server) {
 		tmpImg.Close()
 		defer os.Remove(imgPath)
 
-		winArg := "root"
-		if in.Window != "" {
-			winArg = in.Window
-		}
-		capOut, err := runXTool(ctx, 15*time.Second, "import", "-window", winArg, imgPath)
+		capOut, err := captureScreen(ctx, in.Window, imgPath)
 		if err != nil {
 			return textResult(fmt.Sprintf("ocr_error: screenshot failed: %v\n%s", err, string(capOut)))
 		}
@@ -1971,6 +1978,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "camera_capture", Title: "Camera Capture", Description: "Capture a single JPEG photo from the webcam and return it inline. Optionally also saves a copy to disk."}, func(ctx context.Context, _ *mcp.CallToolRequest, in CameraInput) (*mcp.CallToolResult, any, error) {
+		if isDarwin {
+			return textResult("camera_error: belum didukung di macOS (butuh ffmpeg avfoundation); saat ini khusus Linux")
+		}
 		device := in.Device
 		if device == "" {
 			device = "/dev/video0"
@@ -2022,6 +2032,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "record_video", Title: "Record Video", Description: "Record the screen or the webcam for a set number of seconds (max 120), save it as an MP4 under the public assets/ folder, and return its public URL — no video bytes are sent back through the tool result, just the link."}, func(ctx context.Context, _ *mcp.CallToolRequest, in RecordInput) (*mcp.CallToolResult, any, error) {
+		if isDarwin {
+			return textResult("record_error: belum didukung di macOS (butuh ffmpeg avfoundation); saat ini khusus Linux")
+		}
 		source := in.Source
 		if source == "" {
 			source = "screen"
@@ -2539,6 +2552,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "system_stats", Title: "System Stats", Description: "Show a snapshot of the machine's health: CPU core count and load average, RAM and swap usage, root disk usage, battery status/health, and temperatures when available."}, func(ctx context.Context, _ *mcp.CallToolRequest, _ SystemStatsInput) (*mcp.CallToolResult, any, error) {
+		if isDarwin {
+			return textResult(darwinSystemStats(ctx))
+		}
 		var sb strings.Builder
 
 		if out, err := runRawCommand(ctx, "nproc", 5*time.Second); err == nil {

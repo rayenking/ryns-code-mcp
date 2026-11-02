@@ -1,7 +1,7 @@
 # ryns-code-mcp
 
 An [MCP](https://modelcontextprotocol.io) server, written in Go, that lets an AI
-assistant work on your Linux machine: files, search, shell commands,
+assistant work on your Linux or macOS machine: files, search, shell commands,
 long-running processes, git, screenshots, simple local spreadsheets, and more.
 
 > ## ⚠️ Security warning
@@ -29,6 +29,34 @@ long-running processes, git, screenshots, simple local spreadsheets, and more.
 
 Some tools depend on external programs (screenshots, OCR, input control, camera
 and recording, `opencode`, linters). They fail gracefully when those are missing.
+
+## Platform support
+
+The server builds and runs on Linux and macOS. File, shell, process, git and
+sheet tools are identical on both. Desktop tools use native utilities per OS:
+
+| Tool(s) | Linux | macOS |
+| --- | --- | --- |
+| `screenshot`, `ocr_screenshot` | `import` (ImageMagick), `tesseract` | `screencapture`, `tesseract` (`brew install tesseract`) |
+| `clipboard_get`, `clipboard_set` | `xclip` | `pbpaste`, `pbcopy` |
+| `keyboard_type`, `key_press` | `xdotool` | `osascript` (System Events) |
+| `mouse_click` | `xdotool` | `cliclick` (`brew install cliclick`) |
+| `get_active_window`, `list_windows` | `xdotool` | `osascript` (System Events) |
+| `notify_send` | `notify-send` | `osascript` |
+| `system_stats` | `/proc`, `free`, `upower`, `sensors` | `sysctl`, `vm_stat`, `pmset`, `system_profiler` (temperature needs `osx-cpu-temp`) |
+| `camera_capture`, `record_video` | `ffmpeg` (v4l2, x11grab) | not supported yet |
+
+Notes for macOS:
+
+- Grant the app that launches the server (Terminal, your MCP client, ...)
+  **Screen Recording** (screenshots) and **Accessibility** (keyboard, windows)
+  in System Settings → Privacy & Security.
+- `brew install ripgrep` is required for `search_files` and `grep`. Homebrew's
+  `bin` directories are added to `PATH` automatically.
+- The `window` argument of `screenshot` is a CGWindowID on macOS (an X window id
+  on Linux). `get_active_window` reports the process id instead of a window id.
+- The macOS code paths are cross-compiled and unit tested for the parsing logic,
+  but have not been exercised on real Apple hardware yet. Issues and PRs are welcome.
 
 ## Build and run
 
