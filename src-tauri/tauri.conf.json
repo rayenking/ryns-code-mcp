@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ryns-mcp-control",
+  "version": "0.1.0",
+  "identifier": "com.ryns.control",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ipc: tauri:;"
+    },
+    "windows": [
+      {
+        "title": "Ryns Control",
+        "width": 1050,
+        "height": 720,
+        "minWidth": 900,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ryns Control</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="console-body">
+  <div class="app-layout">
+    <!-- TOP NAVIGATION & STATUS BAR -->
+    <header class="app-topbar">
+      <div class="topbar-left">
+        <div class="brand">
+          <span class="brand-badge">RYNS</span>
+          <span class="brand-title">CONTROL</span>
+        </div>
+        <nav class="main-nav" role="tablist" aria-label="Main Navigation">
+          <button class="nav-tab active" id="tabNavServer" role="tab" aria-selected="true" data-view="server">
+            Server
+          </button>
+          <button class="nav-tab" id="tabNavTools" role="tab" aria-selected="false" data-view="tools">
+            Tools
+            <span class="badge" id="toolsTotalBadge">55</span>
+          </button>
+          <button class="nav-tab" id="tabNavSafety" role="tab" aria-selected="false" data-view="safety">
+            Safety
+            <span class="badge count-badge" id="pendingCount">0</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="topbar-right">
+        <div class="server-status-pill" id="serverStatus" title="Server Status">
+          <span class="status-dot disconnected" id="statusDot"></span>
+          <span class="status-label" id="statusLabel">Checking server...</span>
+        </div>
+        <button id="btnOpenSettings" class="btn-icon" title="Settings (,)">&#9881;</button>
+      </div>
+    </header>
+
+    <!-- MAIN VIEW CONTAINER -->
+    <div class="view-container">
+      
+      <!-- ==================================================================
+           VIEW 1: SERVER CONTROL
+           ================================================================== -->
+      <section class="view-panel" id="viewServer" role="tabpanel">
+        <div class="server-dashboard">
+          
+          <!-- PRIMARY SERVER CARD -->
+          <div class="server-card main-card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <span class="card-badge" id="serverStateBadge">STOPPED</span>
+                <h2 class="card-title">MCP Server Instance</h2>
+              </div>
+              <div class="server-actions" id="serverActionButtons">
+                <button class="btn-action btn-start" id="btnStartServer">Start Server</button>
+                <button class="btn-action btn-restart" id="btnRestartServer">Restart</button>
+                <button class="btn-action btn-stop" id="btnStopServer">Stop</button>
+              </div>
+            </div>
+
+            <div class="card-grid">
+              <div class="stat-box">
+                <span class="stat-label">PORT</span>
+                <span class="stat-value font-mono" id="serverStatPort">8799</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">PID</span>
+                <span class="stat-value font-mono" id="serverStatPid">-</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">SECURITY MODE</span>
+                <span class="stat-value font-mono" id="serverStatMode">enforce</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">AUTHENTICATION</span>
+                <span class="stat-value font-mono" id="serverStatAuth">Disabled (Localhost)</span>
+              </div>
+            </div>
+
+            <div class="server-detail-row">
+              <span class="row-label">WORKSPACE ROOT:</span>
+              <code class="row-value" id="serverStatWorkspace">~/RynsWorkspace</code>
+            </div>
+            <div class="server-detail-row">
+              <span class="row-label">SERVER VERSION:</span>
+              <span class="row-value font-mono" id="serverStatVersion">-</span>
+            </div>
+          </div>
+
+          <!-- SYSTEM INTEGRATION CARD -->
+          <div class="server-card">
+            <h3 class="card-subtitle">System Integration &amp; Startup</h3>
+            <div class="setting-toggle-row">
+              <div class="toggle-text">
+                <span class="toggle-title">Launch at Login</span>
+                <span class="toggle-desc">Automatically start Ryns Control minimized to tray on system boot.</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="toggleAutostart">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <!-- TOOL COUNTS SUMMARY CARD -->
+          <div class="server-card">
+            <h3 class="card-subtitle">Active Tool Policy Summary</h3>
+            <div class="counts-summary-grid">
+              <div class="summary-pill enabled">
+                <span class="summary-count" id="summaryEnabledCount">0</span>
+                <span class="summary-label">Enabled</span>
+              </div>
+              <div class="summary-pill ask">
+                <span class="summary-count" id="summaryAskCount">0</span>
+                <span class="summary-label">Ask (Mandatory Veto)</span>
+              </div>
+              <div class="summary-pill disabled">
+                <span class="summary-count" id="summaryDisabledCount">0</span>
+                <span class="summary-label">Disabled (Hidden)</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ==================================================================
+           VIEW 2: TOOLS MANAGEMENT (The Core)
+           ================================================================== -->
+      <section class="view-panel hidden" id="viewTools" role="tabpanel">
+        <div class="tools-layout">
+          <!-- Tools List Column -->
+          <div class="tools-list-column">
+            <div class="tools-toolbar">
+              <input type="text" id="toolsFilterInput" class="filter-input" placeholder="Search 55 tools by name or description... (/)" autocomplete="off">
+              <div class="filter-segmented">
+                <button class="seg-btn active" data-filter="all">All (<span id="countAll">55</span>)</button>
+                <button class="seg-btn" data-filter="enabled">Enabled (<span id="countEnabled">0</span>)</button>
+                <button class="seg-btn" data-filter="ask">Ask (<span id="countAsk">0</span>)</button>
+                <button class="seg-btn" data-filter="disabled">Disabled (<span id="countDisabled">0</span>)</button>
+              </div>
+            </div>
+
+            <ul class="tools-list" id="toolsList" role="listbox" aria-label="Available tools">
+              <!-- Rendered via JS -->
+            </ul>
+
+            <div class="empty-state hidden" id="toolsEmptyState">
+              <div class="empty-title">No matching tools</div>
+              <div class="empty-desc">Check your search query or filter criteria.</div>
+            </div>
+          </div>
+
+          <!-- Tool Detail Column / Sheet -->
+          <div class="tool-detail-column" id="toolDetailColumn">
+            <div class="no-selection" id="noToolSelected">
+              <div class="terminal-placeholder">
+                <div class="placeholder-prompt">$ ryns-tools --inspect</div>
+                <div class="placeholder-text">Select any tool from the list to view its specification, configure access permissions, or toggle pre-execution safety gates.</div>
+              </div>
+            </div>
+
+            <div class="tool-sheet hidden" id="toolSheet">
+              <header class="sheet-header">
+                <div class="sheet-meta">
+                  <span class="tool-tag" id="sheetToolName">tool_name</span>
+                  <span class="tool-title-sub" id="sheetToolTitle">-</span>
+                </div>
+              </header>
+
+              <div class="sheet-body">
+                <!-- ACCESS CONTROL GROUP -->
+                <div class="sheet-section">
+                  <label class="sheet-label">ACCESS PERMISSION</label>
+                  <div class="segmented-control access-control" role="radiogroup">
+                    <button type="button" class="seg-option" data-access="enabled" id="segAccessEnabled">
+                      Enabled
+                    </button>
+                    <button type="button" class="seg-option" data-access="ask" id="segAccessAsk">
+                      Ask (Approval)
+                    </button>
+                    <button type="button" class="seg-option" data-access="disabled" id="segAccessDisabled">
+                      Disabled
+                    </button>
+                  </div>
+                  <div class="sheet-help" id="accessHelpText">
+                    Tool is visible and executes normally according to safety policies.
+                  </div>
+                </div>
+
+                <!-- SAFETY GATE GROUP -->
+                <div class="sheet-section">
+                  <div class="switch-row">
+                    <div class="switch-label-group">
+                      <label class="sheet-label" for="switchSafety">SAFETY GATE</label>
+                      <span class="sheet-sublabel">Pre-execution veto checks (cc-safety-net / secret-path rules)</span>
+                    </div>
+                    <label class="switch" id="safetySwitchWrapper" title="">
+                      <input type="checkbox" id="switchSafety">
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="safety-incapable-notice hidden" id="safetyIncapableNotice">
+                    &#9432; No pre-execution safety checks available for this tool.
+                  </div>
+                </div>
+
+                <!-- DESCRIPTION -->
+                <div class="sheet-section">
+                  <label class="sheet-label">DESCRIPTION</label>
+                  <div class="tool-desc-box font-mono" id="sheetToolDesc">
+                    -
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================================================================
+           VIEW 3: SAFETY APPROVALS CONSOLE
+           ================================================================== -->
+      <section class="view-panel hidden" id="viewSafety" role="tabpanel">
+        <div class="safety-layout">
+          <!-- LEFT PANE: Queue & History Tabs -->
+          <aside class="sidebar-pane">
+            <nav class="queue-nav" role="tablist">
+              <button class="nav-tab active" id="tabPending" role="tab" aria-selected="true" data-tab="pending">
+                Pending Vetoes
+                <span class="badge count-badge" id="safetyTabBadge">0</span>
+              </button>
+              <button class="nav-tab" id="tabHistory" role="tab" aria-selected="false" data-tab="history">
+                Audit History
+                <span class="badge" id="historyCount">0</span>
+              </button>
+            </nav>
+
+            <section class="queue-section" id="pendingSection" role="tabpanel">
+              <div class="queue-filter-bar">
+                <input type="text" id="queueFilter" class="filter-input" placeholder="Filter requests... (/) " autocomplete="off" spellcheck="false">
+                <button id="btnRefresh" class="btn-icon" title="Refresh queue (R)">&#x21bb;</button>
+              </div>
+
+              <ul class="queue-list" id="queueList" role="listbox">
+                <!-- Pending items rendered here -->
+              </ul>
+
+              <div class="empty-state hidden" id="emptyQueue">
+                <div class="empty-icon">&#10003;</div>
+                <div class="empty-title">Queue Clear</div>
+                <div class="empty-desc">No safety approvals pending. Policy engine is actively enforcing in the background.</div>
+              </div>
+            </section>
+
+            <section class="queue-section hidden" id="historySection" role="tabpanel">
+              <div class="queue-filter-bar">
+                <span class="section-subtitle">Session Decisions</span>
+                <button id="btnClearHistory" class="btn-text btn-small">Clear</button>
+              </div>
+              <ul class="history-list" id="historyList">
+                <!-- History records rendered here -->
+              </ul>
+              <div class="empty-state hidden" id="emptyHistory">
+                <div class="empty-title">No Audit Records</div>
+                <div class="empty-desc">Decisions made during this session will appear here.</div>
+              </div>
+            </section>
+
+            <footer class="sidebar-footer">
+              <div class="key-hints">
+                <span><kbd>A</kbd> Allow</span>
+                <span><kbd>S</kbd> Session</span>
+                <span><kbd>D</kbd> Deny</span>
+                <span><kbd>J</kbd>/<kbd>K</kbd> Nav</span>
+              </div>
+            </footer>
+          </aside>
+
+          <!-- RIGHT PANE: Request Inspector -->
+          <main class="inspector-pane" id="inspectorPane">
+            <div class="no-selection" id="noSelectionView">
+              <div class="terminal-placeholder">
+                <div class="placeholder-prompt">$ ryns-safety --status</div>
+                <div class="placeholder-text">Select an approval request from the queue or wait for an incoming veto event.</div>
+              </div>
+            </div>
+
+            <article class="detail-view hidden" id="detailView">
+              <header class="detail-header">
+                <div class="detail-meta-left">
+                  <span class="tool-tag" id="detailTool">tool</span>
+                  <span class="req-id" id="detailReqId">ID: -</span>
+                </div>
+                <div class="timeout-meter" id="timeoutMeter">
+                  <span class="timeout-label">AUTO-DENY IN</span>
+                  <span class="timeout-seconds" id="timeoutCountdown">--s</span>
+                  <div class="timeout-bar-track">
+                    <div class="timeout-bar-fill" id="timeoutBarFill"></div>
+                  </div>
+                </div>
+              </header>
+
+              <section class="field-group cwd-group">
+                <label class="field-label">WORKING DIRECTORY</label>
+                <div class="code-bar">
+                  <code class="cwd-text" id="detailCwd">-</code>
+                  <button class="btn-copy" id="btnCopyCwd" title="Copy working directory">Copy</button>
+                </div>
+              </section>
+
+              <section class="field-group command-group">
+                <div class="field-header">
+                  <label class="field-label">RAW COMMAND / PAYLOAD</label>
+                  <button class="btn-copy" id="btnCopyCmd" title="Copy full command">Copy Command</button>
+                </div>
+                <div class="terminal-box" tabindex="0" role="region" aria-label="Command content">
+                  <div class="terminal-prefix">$</div>
+                  <pre class="terminal-code" id="detailCommand"><code></code></pre>
+                </div>
+              </section>
+
+              <section class="field-group reason-group">
+                <label class="field-label">SAFETY POLICY TRIGGER</label>
+                <div class="reason-card">
+                  <div class="reason-rule">
+                    <span class="rule-label">RULE ID:</span>
+                    <code class="rule-id-text" id="detailRuleId">-</code>
+                  </div>
+                  <div class="reason-explanation" id="detailReason">-</div>
+                </div>
+              </section>
+
+              <footer class="action-bar" role="toolbar">
+                <div class="action-left">
+                  <button class="btn-action btn-allow" id="btnAllow" title="Allow once (Shortcut: A)">
+                    <span class="btn-shortcut">A</span>
+                    <span class="btn-title">ALLOW ONCE</span>
+                  </button>
+                  <button class="btn-action btn-allow-session" id="btnAllowSession" title="Allow identical commands for session (Shortcut: S)">
+                    <span class="btn-shortcut">S</span>
+                    <span class="btn-title">ALLOW FOR SESSION</span>
+                  </button>
+                </div>
+                <div class="action-right">
+                  <button class="btn-action btn-deny" id="btnDeny" title="Veto request (Shortcut: D)">
+                    <span class="btn-shortcut">D</span>
+                    <span class="btn-title">DENY</span>
+                  </button>
+                </div>
+              </footer>
+            </article>
+          </main>
+        </div>
+      </section>
+
+    </div>
+  </div>
+
+  <!-- SETTINGS MODAL -->
+  <dialog class="modal-dialog" id="settingsModal" aria-labelledby="settingsTitle">
+    <div class="modal-content">
+      <header class="modal-header">
+        <h2 id="settingsTitle" class="modal-title">Ryns Control Settings</h2>
+        <button class="btn-icon" id="btnCloseSettings" aria-label="Close dialog">&times;</button>
+      </header>
+
+      <form id="settingsForm" class="modal-body" onsubmit="return false;">
+        <div class="form-group">
+          <label for="inputServerPort" class="input-label">Server Port</label>
+          <input type="number" id="inputServerPort" class="form-input" min="1024" max="65535" value="8799" required>
+          <span class="input-hint">TCP port for the MCP Streamable HTTP server (default: 8799).</span>
+        </div>
+
+        <div class="form-group">
+          <label for="inputServerBinary" class="input-label">Custom Binary Path (Optional)</label>
+          <input type="text" id="inputServerBinary" class="form-input" placeholder="Leave empty for bundled server" autocomplete="off">
+          <span class="input-hint">Override path to ryns-code-mcp executable. Defaults to bundled copy.</span>
+        </div>
+
+        <div class="form-group">
+          <label for="selectSafetyMode" class="input-label">Default Safety Mode</label>
+          <select id="selectSafetyMode" class="form-input form-select">
+            <option value="enforce">enforce (Default - reject unsafe actions / ASK)</option>
+            <option value="observe">observe (Audit and log only, allow execution)</option>
+            <option value="off">off (Completely bypass pre-execution gates)</option>
+          </select>
+        </div>
+
+        <!-- AUTH TOKEN (Hidden unless server requires auth or explicitly set) -->
+        <div class="form-group" id="groupAuthToken">
+          <label for="inputAuthToken" class="input-label">Auth Token (Optional)</label>
+          <div class="password-wrapper">
+            <input type="password" id="inputAuthToken" class="form-input" placeholder="Optional bearer token..." autocomplete="off">
+            <button type="button" id="btnToggleToken" class="btn-icon-subtle" title="Toggle visibility">&#128065;</button>
+          </div>
+          <span class="input-hint">Only required if server was started with RYNS_AUTH_TOKEN.</span>
+        </div>
+
+        <div class="form-test-row">
+          <button type="button" id="btnTestConn" class="btn-secondary">Test Connection</button>
+          <span class="test-result-indicator" id="testResultIndicator"></span>
+        </div>
+
+        <footer class="modal-footer">
+          <button type="button" id="btnCancelSettings" class="btn-secondary">Cancel</button>
+          <button type="submit" id="btnSaveSettings" class="btn-primary">Save Settings</button>
+        </footer>
+      </form>
+    </div>
+  </dialog>
+
+  <!-- NOTIFICATION TOAST CONTAINER -->
+  <div class="toast-container" id="toastContainer" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+[package]
+name = "ryns-mcp-control"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ryns_mcp_control_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ryns-mcp-control"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+tauri-plugin-autostart = "2.7.0"

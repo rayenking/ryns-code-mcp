@@ -1,0 +1,14 @@
+{
+  "name": "ryns-safety-sidecar",
+  "version": "0.9.0-rust.1",
+  "private": true,
+  "type": "module",
+  "description": "Newline-JSON headless bridge around cc-safety-net checkCommand for the ryns-code-mcp Rust server.",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "cc-safety-net": "^2.7.2"
+  }
+}
