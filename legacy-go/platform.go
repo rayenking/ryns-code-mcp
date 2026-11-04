@@ -18,6 +18,28 @@ import (
 
 var isDarwin = runtime.GOOS == "darwin"
 
+// isWindows selects the Windows code paths. Core tools (files, shell via
+// PowerShell, git, sheets, todos) work there; platform-specific desktop/media
+// tools degrade with clear errors (see windowsUnsupported).
+var isWindows = runtime.GOOS == "windows"
+
+// shellCommand resolves how to run a shell command line on the current
+// platform: a login bash on unix, and an end-user's native shell (PowerShell)
+// on Windows, since cmd.exe parsing is too weak for the AI's command strings.
+func shellCommand(command string) (name string, args []string) {
+	if isWindows {
+		return "powershell.exe", []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command}
+	}
+	return "/bin/bash", []string{"-lc", command}
+}
+
+// normalizeLF converts Windows-style CRLF line endings to LF so output
+// parsing (sheet data, gold price JSON, git output, ...) behaves the same
+// when commands run under PowerShell on Windows.
+func normalizeLF(s string) string {
+	return strings.ReplaceAll(s, "\r\n", "\n")
+}
+
 func init() {
 	// GUI-launched MCP clients often start with a minimal PATH that lacks
 	// Homebrew, so tools such as rg, tesseract and cliclick are not found.
@@ -38,6 +60,7 @@ func runPlain(ctx context.Context, timeout time.Duration, stdin, name string, ar
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, name, args...)
+	cmd.Env = childEnv()
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -242,13 +265,28 @@ func macNotify(ctx context.Context, title, body string) ([]byte, error) {
 	return osascript(ctx, 5*time.Second, script)
 }
 
+// windowsUnsupported reports whether the tool has no Windows implementation,
+// returning the tool's error line when it does. Desktop and media tools are
+// deliberate X11/Linux pairs with no Windows equivalents wired up yet.
+func windowsUnsupported(tool string) (bool, string) {
+	if !isWindows {
+		return false, ""
+	}
+	return true, fmt.Sprintf("%s: not supported on windows", tool)
+}
+
 // ptyCommand starts command under a real PTY via script(1), whose syntax
 // differs between util-linux and BSD.
 func ptyCommand(command string) *exec.Cmd {
+	var cmd *exec.Cmd
 	if isDarwin {
-		return exec.Command("script", "-q", "/dev/null", "/bin/bash", "-lc", command)
+		_, shellArgs := shellCommand(command)
+		cmd = exec.Command("script", append([]string{"-q", "/dev/null"}, shellArgs...)...)
+	} else {
+		cmd = exec.Command("script", "-qefc", command, "/dev/null")
 	}
-	return exec.Command("script", "-qefc", command, "/dev/null")
+	cmd.Env = childEnv()
+	return cmd
 }
 
 // ---- system stats (macOS) ---------------------------------------------------

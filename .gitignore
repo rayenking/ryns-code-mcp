@@ -8,3 +8,6 @@ npm-debug.log*
 /.state/
 /.omo/
 test.txt
+
+# Cross-compile artifacts
+ryns-code-mcp.exe

@@ -1,0 +1,45 @@
+[package]
+name = "ryns-code-mcp"
+# Server version MUST stay in sync with the contract in
+# docs/PLAN_RUST_PORT.md §2 (1.0.0); the rmcp server handler reports
+# CARGO_PKG_VERSION as serverInfo.version.
+version = "1.0.0"
+edition = "2024"
+publish = false
+description = "Rust port of the ryns-code-mcp MCP server (Phase 1 alpha skeleton)"
+
+[dependencies]
+rmcp = { version = "3.8.0", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+# ServerHandler signatures require schemars derives on tool input structs;
+# rmcp pulls schemars in as an optional/normal dep so we depend on it
+# directly for #[derive(schemars::JsonSchema)].
+schemars = "1.1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "process",
+    "time",
+    "net",
+    "signal",
+    "sync",
+    "fs",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.8"
+subtle = "2"
+tokio-stream = { version = "0.1", features = ["sync"] }
+anyhow = "1"
+base64 = "0.22" # already in Cargo.lock (via rmcp); used for inline image content
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2" # already in Cargo.lock (via tokio); kill_process signals
+
+[profile.release]
+strip = true

@@ -13,8 +13,12 @@ ENABLED_FILE="$STATE_DIR/enabled"
 PID_FILE="$STATE_DIR/pid"
 STATUS_FILE="$STATE_DIR/status"
 PACKAGE_JSON="$ROOT/package.json"
-ENTRYPOINT="main.go"
-BINARY="$ROOT/.state/ryns-code-mcp"
+RUST_DIR="$ROOT/ryns-code-mcp-rs"
+RUST_RELEASE_BIN="$RUST_DIR/target/release/ryns-code-mcp"
+RUST_DEBUG_BIN="$RUST_DIR/target/debug/ryns-code-mcp"
+LEGACY_GO_DIR="$ROOT/legacy-go"
+LEGACY_GO_ENTRYPOINT="$LEGACY_GO_DIR/main.go"
+GO_BINARY="$STATE_DIR/ryns-go-legacy"
 
 log() {
   printf '[ryns-code-mcp] %s\n' "$*" >&2
@@ -33,11 +37,13 @@ Commands:
   ./run --port PORT     Serve MCP over Streamable HTTP on 127.0.0.1:PORT
                         (for cloudflared tunnel or other HTTP clients);
                         defaults to stdio
-  ./run --version       Show MCP version from package.json
+  ./run --version       Show MCP version (Rust crate version)
   ./run --help          Show this help
 
 Options:
   --workspace PATH      Workspace root (also supported by RYNS_WORKSPACE_ROOT)
+  -go                   Escape hatch: run the legacy Go server
+                        (legacy-go/, built into .state/ryns-go-legacy)
 
 Environment:
   RYNS_WORKSPACE_ROOT   Override the default workspace:
@@ -47,14 +53,57 @@ State:
   $STATE_DIR
 
 Notes:
-  The default invocation is an MCP stdio server. stdin/stdout are passed
-  directly to the existing MCP entrypoint. Launcher logs go to stderr.
+  The default invocation is the Rust server (ryns-code-mcp-rs), built
+  with `cargo build` (debug, fast) into ryns-code-mcp-rs/target/debug;
+  an existing release binary is preferred. stdin/stdout are passed
+  directly to the MCP entrypoint; launcher logs go to stderr.
   The runner does not create a daemon for tunnel-client stdio usage.
 EOF
 }
 
 read_version() {
+  # Prefer the Rust crate version (the primary server); fall back to the
+  # root package.json for legacy layouts.
+  if [[ -f "$RUST_DIR/Cargo.toml" ]]; then
+    awk -F'"' '/^version =/{print $2; exit}' "$RUST_DIR/Cargo.toml" \
+      || sed -n 's/^version = "\(.*\)"/\1/p' "$RUST_DIR/Cargo.toml" | head -1
+    return 0
+  fi
   node -e 'const p=require(process.argv[1]); process.stdout.write(String(p.version || "unknown"))' "$PACKAGE_JSON"
+}
+
+# Resolves the binary the launcher will exec: Rust by default, legacy Go with
+# -go. Prints the path; builds it first if missing/stale.
+RUST_BIN=""
+GO_MODE=false
+
+resolve_rust_binary() {
+  if [[ -x "$RUST_RELEASE_BIN" ]]; then
+    printf '%s\n' "$RUST_RELEASE_BIN"
+    return 0
+  fi
+  cd "$RUST_DIR"
+  local stale_src
+  stale_src="$(find "$RUST_DIR/src" -name '*.rs' -newer "$RUST_DEBUG_BIN" 2>/dev/null | head -1)"
+  if [[ ! -x "$RUST_DEBUG_BIN" || "$RUST_DIR/Cargo.toml" -nt "$RUST_DEBUG_BIN" || -n "$stale_src" ]]; then
+    log "building RynsCode MCP (Rust, debug) — first run takes a moment"
+    cargo build
+  fi
+  cd "$ROOT"
+  printf '%s\n' "$RUST_DEBUG_BIN"
+}
+
+resolve_go_binary() {
+  cd "$ROOT"
+  if [[ ! -x "$GO_BINARY" || "$LEGACY_GO_ENTRYPOINT" -nt "$GO_BINARY" || "$ROOT/go.mod" -nt "$GO_BINARY" || ( -f "$ROOT/go.sum" && "$ROOT/go.sum" -nt "$GO_BINARY" ) ]]; then
+    if [[ ! -f "$ROOT/go.sum" ]]; then
+      log "resolving Go module dependencies"
+      go mod tidy
+    fi
+    log "building legacy Go MCP binary"
+    go build -o "$GO_BINARY" ./legacy-go
+  fi
+  printf '%s\n' "$GO_BINARY"
 }
 
 pid_is_running() {
@@ -63,11 +112,40 @@ pid_is_running() {
   kill -0 "$pid" 2>/dev/null || return 1
 
   # Only consider a PID managed by this runner when its command line still
-  # belongs to this MCP. This prevents killing an unrelated reused PID.
+  # belongs to this MCP. Matches every binary the launcher can exec today
+  # (Rust debug/release, legacy Go) plus a basename fallback so a rebuilt
+  # target path still counts. Prevents killing an unrelated reused PID.
   local cmd
   cmd="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-  [[ "$cmd" == *"$ROOT/run"* || "$cmd" == *"$ROOT/node_modules"* || "$cmd" == *"$ROOT/src/index.ts"* ]]
+  run_pid_cmd_matches "$cmd"
 }
+
+# Pure helper (self-testable via `./run --selftest-pid`): does a ps `args=`
+# string belong to this MCP's known server binaries? The basename match
+# covers the binary even if the crate dir moved.
+run_pid_cmd_matches() {
+  local cmd="$1"
+  [[ "$cmd" == *"$ROOT/run"* \
+    || "$cmd" == *"$ROOT/node_modules"* \
+    || "$cmd" == *"$ROOT/src/index.ts"* \
+    || "$cmd" == *"$RUST_DIR/target/"* \
+    || "$cmd" == *"$STATE_DIR/ryns-go-legacy"* \
+    || "$cmd" == *"ryns-code-mcp"* ]]
+}
+
+# Launcher self-test for the pure PID matcher (no server is started).
+if [[ "${1:-}" == "--selftest-pid" ]]; then
+  case1="$RUST_DIR/target/debug/ryns-code-mcp -port 8799"
+  case2="$STATE_DIR/ryns-go-legacy"
+  case3='some unrelated process --flag'
+  if run_pid_cmd_matches "$case1" && run_pid_cmd_matches "$case2" \
+    && ! run_pid_cmd_matches "$case3"; then
+    echo "selftest-pid: ok"
+    exit 0
+  fi
+  echo "selftest-pid: FAILED" >&2
+  exit 1
+fi
 
 managed_pid() {
   [[ -f "$PID_FILE" ]] || return 1
@@ -116,19 +194,28 @@ mkdir -p "$STATE_DIR"
 COMMAND="run"
 WORKSPACE_ARG_SET=false
 PORT=""
+GO_MODE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -go)
+      GO_MODE=true
+      shift
+      ;;
     --workspace)
       [[ $# -ge 2 ]] || { echo "Missing value for --workspace" >&2; exit 2; }
       WORKSPACE="$2"
       WORKSPACE_ARG_SET=true
       shift 2
       ;;
-    --port)
-      [[ $# -ge 2 ]] || { echo "Missing value for --port" >&2; exit 2; }
+    --port|-port)
+      [[ $# -ge 2 ]] || { echo "Missing value for -port" >&2; exit 2; }
       PORT="$2"
       shift 2
+      ;;
+    --port=*|-port=*)
+      PORT="${1#*=}"
+      shift
       ;;
     --enable|--disable|--status|--restart|--version|--help)
       if [[ "$COMMAND" != "run" ]]; then
@@ -200,7 +287,7 @@ case "$COMMAND" in
     fi
     echo "version: $version"
     echo "workspace: $WORKSPACE"
-    echo "entrypoint: $ROOT/$ENTRYPOINT"
+    echo "entrypoint: $RUST_DIR (Rust server)"
     ;;
 
   restart)
@@ -229,26 +316,24 @@ case "$COMMAND" in
   run)
     cd "$ROOT"
     export RYNS_WORKSPACE_ROOT="$WORKSPACE"
-    export RYNS_MCP_ENTRYPOINT="$ROOT/$ENTRYPOINT"
 
     # Do not daemonize, redirect, or wrap stdio. tunnel-client owns this
     # process and speaks MCP directly over stdin/stdout.
-    # Build once into .state, then exec the native Go binary. This removes the
-    # Node/tsx runtime dependency from the MCP launch path.
-    if [[ ! -x "$BINARY" || "$ROOT/main.go" -nt "$BINARY" || "$ROOT/go.mod" -nt "$BINARY" || ( -f "$ROOT/go.sum" && "$ROOT/go.sum" -nt "$BINARY" ) ]]; then
-      if [[ ! -f "$ROOT/go.sum" ]]; then
-        log "resolving Go module dependencies"
-        go mod tidy
-      fi
-      log "building native Go MCP binary"
-      go build -o "$BINARY" .
+    local_server=""
+    if $GO_MODE; then
+      local_server="$(resolve_go_binary)"
+      log "starting MCP (legacy Go): $local_server"
+    else
+      RUST_BIN="$(resolve_rust_binary)"
+      local_server="$RUST_BIN"
+      log "starting MCP (Rust): $local_server"
     fi
     if [[ -n "$PORT" ]]; then
-      log "starting MCP HTTP on 127.0.0.1:$PORT: $BINARY"
-      exec "$BINARY" -port "$PORT"
+      log "starting MCP HTTP on 127.0.0.1:$PORT: $local_server"
+      exec "$local_server" -port "$PORT"
     fi
-    log "starting MCP stdio: $BINARY"
-    exec "$BINARY"
+    log "starting MCP stdio: $local_server"
+    exec "$local_server"
     ;;
 
   *)

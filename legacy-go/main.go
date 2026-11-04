@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,7 +24,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -31,7 +31,7 @@ import (
 
 const (
 	serverName    = "ryns-code-mcp"
-	serverVersion = "0.7.5"
+	serverVersion = "0.8.0"
 	maxOutput     = 100000
 	maxReadLines  = 2000
 	maxLineLength = 2000
@@ -74,6 +74,93 @@ var publicBaseURL = func() string {
 	}
 	return "http://127.0.0.1:8799"
 }()
+
+// childEnv returns the environment for every child process this server
+// spawns: os.Environ() with RYNS_AUTH_TOKEN removed, so the HTTP-mode bearer
+// token cannot leak into the environment of commands started by
+// execute_command, start_process, lint tools, git, etc. (a child could
+// otherwise expose it via its own `env`). The key comparison is
+// case-insensitive (the Windows environment is case-insensitive and
+// `ryns_auth_token` variants must not survive), but compounds like
+// RYNS_AUTH_TOKEN_FOO are distinct keys and stay. Use this instead of
+// os.Environ() on every exec.Command; commands with a nil Env implicitly
+// inherit the parent environment and must get cmd.Env = childEnv() set
+// explicitly.
+func childEnv() []string {
+	return filterAuthEnv(os.Environ())
+}
+
+// filterAuthEnv strips entries whose key is RYNS_AUTH_TOKEN (compared
+// case-insensitively; key/value split on the first '='), regardless of value
+// form (bare key, KEY=, KEY=secret). Compound keys such as
+// RYNS_AUTH_TOKEN_FOO are distinct keys and kept. Pure so tests can assert
+// the filter output directly, independent of the live process environment.
+func filterAuthEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if strings.EqualFold(key, "RYNS_AUTH_TOKEN") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// authTokens holds the accepted bearer tokens from RYNS_AUTH_TOKEN
+// (comma-separated, entries trimmed, empty entries ignored). HTTP mode
+// refuses to start without a valid token; stdio mode never checks auth.
+var authTokens = parseAuthTokens()
+
+func parseAuthTokens() []string {
+	var toks []string
+	for _, entry := range strings.Split(os.Getenv("RYNS_AUTH_TOKEN"), ",") {
+		if t := strings.TrimSpace(entry); t != "" {
+			toks = append(toks, t)
+		}
+	}
+	return toks
+}
+
+// authMiddleware rejects every request that does not present a valid token.
+// Candidates come from both `Authorization: Bearer <token>` and
+// `X-RYNS-Auth: <token>` headers and are validated together, so a bad Bearer
+// value does not cancel a valid X-RYNS-Auth value. It is the single access
+// gate for all HTTP routes (/mcp, /assets/, /api/save/). The check runs
+// constant-time over every candidate x every configured token, with no
+// early exit on a match.
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var presented []string
+		if parts := strings.SplitN(r.Header.Get("Authorization"), " ", 2); len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			if v := strings.TrimSpace(parts[1]); v != "" {
+				presented = append(presented, v)
+			}
+		}
+		if v := strings.TrimSpace(r.Header.Get("X-RYNS-Auth")); v != "" {
+			presented = append(presented, v)
+		}
+		matches := 0
+		for _, p := range presented {
+			for _, tok := range authTokens {
+				if subtle.ConstantTimeCompare([]byte(tok), []byte(p)) == 1 {
+					matches++
+				}
+			}
+		}
+		if len(authTokens) == 0 || len(presented) == 0 || matches == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Www-Authenticate", "Bearer")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 func clip(s string) string {
 	if len(s) <= maxOutput {
@@ -139,7 +226,7 @@ func contextAroundLine(content string, lineNum, context int) string {
 // its desktop on :0, so we point every such command there explicitly since
 // tool invocations don't otherwise inherit the user's desktop session env.
 func xEnv() []string {
-	env := append(os.Environ(), "DISPLAY=:0")
+	env := append(childEnv(), "DISPLAY=:0")
 	home := os.Getenv("HOME")
 	if _, err := os.Stat(filepath.Join(home, ".Xauthority")); err == nil {
 		env = append(env, "XAUTHORITY="+filepath.Join(home, ".Xauthority"))
@@ -368,11 +455,12 @@ func renderSheetTable(s Sheet, startRow, endRow int) string {
 func runRawCommand(ctx context.Context, command string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-lc", command)
+	name, args := shellCommand(command)
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = workspace
-	cmd.Env = os.Environ()
+	cmd.Env = childEnv()
 	out, err := cmd.Output()
-	return strings.TrimSpace(string(out)), err
+	return strings.TrimSpace(normalizeLF(string(out))), err
 }
 
 // ---- ACP (Agent Client Protocol) client: lets tools like acp_opencode
@@ -608,7 +696,7 @@ func runACPAgent(ctx context.Context, spec acpAgentSpec) (string, error) {
 
 	cmd := exec.CommandContext(ctx, spec.Command, spec.Args...)
 	cmd.Dir = spec.Cwd
-	cmd.Env = os.Environ()
+	cmd.Env = childEnv()
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
@@ -700,15 +788,16 @@ func stripACPNoiseTags(s string) string {
 func runCommand(ctx context.Context, command, cwd string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-lc", command)
+	name, args := shellCommand(command)
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = cwd
-	cmd.Env = os.Environ()
+	cmd.Env = childEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Sprintf("timed_out: true\nstdout:\n%s\nstderr:\n%s", clip(stdout.String()), clip(stderr.String())), nil
+		return fmt.Sprintf("timed_out: true\nstdout:\n%s\nstderr:\n%s", clip(normalizeLF(stdout.String())), clip(normalizeLF(stderr.String()))), nil
 	}
 	code := 0
 	if err != nil {
@@ -719,9 +808,9 @@ func runCommand(ctx context.Context, command, cwd string, timeout time.Duration)
 			return "", err
 		}
 	}
-	out := fmt.Sprintf("exit_code: %d\nstdout:\n%s", code, clip(stdout.String()))
+	out := fmt.Sprintf("exit_code: %d\nstdout:\n%s", code, clip(normalizeLF(stdout.String())))
 	if stderr.Len() > 0 {
-		out += "\nstderr:\n" + clip(stderr.String())
+		out += "\nstderr:\n" + clip(normalizeLF(stderr.String()))
 	}
 	return out, nil
 }
@@ -756,10 +845,11 @@ func startProcess(command, cwd string, interactive bool) (*proc, error) {
 		// process tools so the caller can interact with the program.
 		cmd = ptyCommand(command)
 	} else {
-		cmd = exec.Command("/bin/bash", "-lc", command)
+		name, args := shellCommand(command)
+		cmd = exec.Command(name, args...)
 	}
 	cmd.Dir = cwd
-	cmd.Env = os.Environ()
+	cmd.Env = childEnv()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -795,9 +885,7 @@ func startProcess(command, cwd string, interactive bool) (*proc, error) {
 			if errors.As(err, &ee) {
 				code := ee.ExitCode()
 				p.ExitCode = &code
-				if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-					p.Signal = ws.Signal().String()
-				}
+				p.Signal = exitSignal(ee)
 			}
 		} else {
 			code := 0
@@ -1129,6 +1217,7 @@ func runLintTool(ctx context.Context, name string, args []string, dir string) (s
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
+	cmd.Env = childEnv()
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -1208,6 +1297,9 @@ func main() {
 	setupTools(server)
 
 	if *port > 0 {
+		if len(authTokens) == 0 {
+			log.Fatalf("RYNS_AUTH_TOKEN is required when serving over HTTP; stdio mode does not need it")
+		}
 		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
 		if err != nil {
 			log.Fatalf("listen failed on port %d: %v", *port, err)
@@ -1222,62 +1314,11 @@ func main() {
 				Stateless:                  true,
 			})
 
-		mux := http.NewServeMux()
 		assetsDir := filepath.Join(workspace, "assets")
 		if err := os.MkdirAll(assetsDir, 0755); err != nil {
 			log.Printf("warning: could not create assets dir: %v", err)
 		}
-		mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir(assetsDir))))
-		// /api/save/<name> — lets a static page under /assets/ persist edits
-		// back to disk as assets/data/<name>.json, so an editable HTML table
-		// (add/remove rows, edit cells) can survive a page reload.
-		mux.HandleFunc("/api/save/", func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-				return
-			}
-			rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/save/"), "/")
-			if rest == "" {
-				http.Error(w, `{"error":"invalid name"}`, http.StatusBadRequest)
-				return
-			}
-			segments := strings.Split(rest, "/")
-			for _, seg := range segments {
-				if !pathSegmentPattern.MatchString(seg) {
-					http.Error(w, `{"error":"invalid path segment"}`, http.StatusBadRequest)
-					return
-				}
-			}
-			body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
-			if err != nil {
-				http.Error(w, `{"error":"read failed"}`, http.StatusBadRequest)
-				return
-			}
-			if !json.Valid(body) {
-				http.Error(w, `{"error":"body is not valid JSON"}`, http.StatusBadRequest)
-				return
-			}
-			name := segments[len(segments)-1]
-			dirParts := append([]string{assetsDir, "data"}, segments[:len(segments)-1]...)
-			dataDir := filepath.Join(dirParts...)
-			if err := os.MkdirAll(dataDir, 0755); err != nil {
-				http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
-				return
-			}
-			if err := os.WriteFile(filepath.Join(dataDir, name+".json"), body, 0644); err != nil {
-				http.Error(w, `{"error":"write failed"}`, http.StatusInternalServerError)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"ok":true}`))
-		})
-		mux.Handle("/mcp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// log.Printf("MCP REQUEST: %s %s", r.Method, r.URL.String())
-			// log.Printf("MCP HEADERS: %+v", r.Header)
-
-			h.ServeHTTP(w, r)
-		}))
-
+		mux := authMiddleware(buildMux(assetsDir, h))
 		if err := http.Serve(ln, mux); err != nil {
 			log.Printf("server stopped: %v", err)
 		}
@@ -1291,8 +1332,64 @@ func main() {
 	}
 }
 
+// buildMux assembles the HTTP routes served in Streamable HTTP mode. The
+// returned mux is protected by authMiddleware and exposes three routes:
+// /assets/ (static files from assetsDir, including recordings made by
+// record_video) and /api/save/<name> (used by the bundled sheet viewer to
+// persist edits back to disk as assets/data/<name>.json, so an editable HTML
+// table can survive a page reload), plus /mcp for the MCP Streamable HTTP
+// endpoint.
+func buildMux(assetsDir string, mcpHandler http.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir(assetsDir))))
+	mux.HandleFunc("/api/save/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/save/"), "/")
+		if rest == "" {
+			http.Error(w, `{"error":"invalid name"}`, http.StatusBadRequest)
+			return
+		}
+		segments := strings.Split(rest, "/")
+		for _, seg := range segments {
+			if !pathSegmentPattern.MatchString(seg) {
+				http.Error(w, `{"error":"invalid path segment"}`, http.StatusBadRequest)
+				return
+			}
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+		if err != nil {
+			http.Error(w, `{"error":"read failed"}`, http.StatusBadRequest)
+			return
+		}
+		if !json.Valid(body) {
+			http.Error(w, `{"error":"body is not valid JSON"}`, http.StatusBadRequest)
+			return
+		}
+		name := segments[len(segments)-1]
+		dirParts := append([]string{assetsDir, "data"}, segments[:len(segments)-1]...)
+		dataDir := filepath.Join(dirParts...)
+		if err := os.MkdirAll(dataDir, 0755); err != nil {
+			http.Error(w, `{"error":"server error"}`, http.StatusInternalServerError)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(dataDir, name+".json"), body, 0644); err != nil {
+			http.Error(w, `{"error":"write failed"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	})
+	mux.Handle("/mcp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mcpHandler.ServeHTTP(w, r)
+	}))
+	return mux
+}
+
 func setupTools(server *mcp.Server) {
-	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "execute_command", Title: "Execute Command", Description: "Run a one-shot bash command inside RynsWorkspace. Good for git, npm, tests, builds and system inspection."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, any, error) {
+	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "execute_command", Title: "Execute Command", Description: "Run a one-shot shell command inside RynsWorkspace (bash on Linux/macOS, PowerShell on Windows). Good for git, npm, tests, builds and system inspection."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, any, error) {
 		if in.Command == "" {
 			return textResult("command_error: command is required")
 		}
@@ -1320,11 +1417,22 @@ func setupTools(server *mcp.Server) {
 		if in.Interactive != nil {
 			interactive = *in.Interactive
 		}
+		note := ""
+		if isWindows && interactive {
+			// No PTY on Windows without extra dependencies; run the command
+			// through PowerShell non-interactively instead.
+			note = "windows: no PTY support, process started non-interactively via PowerShell"
+			interactive = false
+		}
 		p, err := startProcess(in.Command, cwd, interactive)
 		if err != nil {
 			return toolError("start_error", err)
 		}
-		return textResult(mustJSON(map[string]any{"process_id": p.ID, "command": in.Command, "cwd": cwd, "started_at": p.StartedAt, "interactive": interactive}))
+		result := map[string]any{"process_id": p.ID, "command": in.Command, "cwd": cwd, "started_at": p.StartedAt, "interactive": interactive}
+		if note != "" {
+			result["note"] = note
+		}
+		return textResult(mustJSON(result))
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "process_output", Title: "Process Output", Description: "Read accumulated stdout/stderr and current state from a long-running process."}, func(_ context.Context, _ *mcp.CallToolRequest, in ProcessInput) (*mcp.CallToolResult, any, error) {
@@ -1333,7 +1441,9 @@ func setupTools(server *mcp.Server) {
 			return textResult("process_not_found: " + in.ProcessID)
 		}
 		p.mu.Lock()
-		out := map[string]any{"process_id": p.ID, "command": p.Command, "cwd": p.CWD, "done": p.Done, "exit_code": p.ExitCode, "signal": p.Signal, "stdout": p.Stdout.String(), "stderr": p.Stderr.String()}
+		// Normalize CRLF at read-time only; the buffers keep the raw PTY
+		// bytes so interactive flows are not affected.
+		out := map[string]any{"process_id": p.ID, "command": p.Command, "cwd": p.CWD, "done": p.Done, "exit_code": p.ExitCode, "signal": p.Signal, "stdout": normalizeLF(p.Stdout.String()), "stderr": normalizeLF(p.Stderr.String())}
 		if in.Clear {
 			p.Stdout.Reset()
 			p.Stderr.Reset()
@@ -1387,15 +1497,16 @@ func setupTools(server *mcp.Server) {
 		if sig == "" {
 			sig = "SIGTERM"
 		}
-		var s os.Signal
-		switch sig {
-		case "SIGTERM":
-			s = syscall.SIGTERM
-		case "SIGKILL":
-			s = syscall.SIGKILL
-		case "SIGINT":
-			s = syscall.SIGINT
-		default:
+		if isWindows {
+			// Windows has no POSIX signals here: any requested signal is
+			// treated as process kill.
+			if err := p.Cmd.Process.Kill(); err != nil {
+				return toolError("kill_error", err)
+			}
+			return textResult(fmt.Sprintf("killed process %s (windows: signal %s is ignored, process terminated)", in.ProcessID, sig))
+		}
+		s, err := mapSignal(sig)
+		if err != nil {
 			return textResult("kill_error: invalid signal")
 		}
 		if err := p.Cmd.Process.Signal(s); err != nil {
@@ -1573,6 +1684,7 @@ func setupTools(server *mcp.Server) {
 		}
 		cmd := exec.CommandContext(ctx, "patch", args...)
 		cmd.Dir = dir
+		cmd.Env = childEnv()
 		cmd.Stdin = strings.NewReader(in.Patch)
 		out, e := cmd.CombinedOutput()
 		if e != nil {
@@ -1664,6 +1776,7 @@ func setupTools(server *mcp.Server) {
 			max = 500
 		}
 		cmd := exec.CommandContext(ctx, "rg", "--files", "--glob", in.Pattern, p)
+		cmd.Env = childEnv()
 		out, e := cmd.Output()
 		if e != nil {
 			if ee, ok := e.(*exec.ExitError); ok && ee.ExitCode() == 1 {
@@ -1702,6 +1815,7 @@ func setupTools(server *mcp.Server) {
 		}
 		args = append(args, in.Pattern, p)
 		cmd := exec.CommandContext(ctx, "rg", args...)
+		cmd.Env = childEnv()
 		out, e := cmd.Output()
 		if e != nil {
 			if ee, ok := e.(*exec.ExitError); ok && ee.ExitCode() == 1 {
@@ -1771,6 +1885,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "screenshot", Title: "Screenshot", Description: "Capture the current screen (or a specific X window) as a PNG image, returned inline. Optionally also saves a copy to disk."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ScreenshotInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("screenshot"); unsupported {
+			return textResult(msg)
+		}
 		tmp, err := os.CreateTemp("", "ryns-screenshot-*.png")
 		if err != nil {
 			return toolError("screenshot_error", err)
@@ -1812,6 +1929,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "clipboard_get", Title: "Clipboard Get", Description: "Read the current text on the X clipboard."}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("clipboard_get"); unsupported {
+			return textResult(msg)
+		}
 		out, err := clipboardRead(ctx)
 		if err != nil {
 			return textResult("(clipboard is empty or unavailable)")
@@ -1820,6 +1940,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "clipboard_set", Title: "Clipboard Set", Description: "Set the X clipboard to the given text."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ClipboardSetInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("clipboard_set"); unsupported {
+			return textResult(msg)
+		}
 		out, err := clipboardWrite(ctx, in.Text)
 		if err != nil {
 			return textResult(fmt.Sprintf("clipboard_error: %v\n%s", err, string(out)))
@@ -1828,6 +1951,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "mouse_click", Title: "Mouse Click", Description: "Move the mouse to (x,y) and click. button: 1=left, 2=middle, 3=right."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ClickInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("mouse_click"); unsupported {
+			return textResult(msg)
+		}
 		button := in.Button
 		if button == 0 {
 			button = 1
@@ -1856,6 +1982,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "keyboard_type", Title: "Keyboard Type", Description: "Type literal text at the current input focus, as if typed on the keyboard."}, func(ctx context.Context, _ *mcp.CallToolRequest, in TypeTextInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("keyboard_type"); unsupported {
+			return textResult(msg)
+		}
 		delay := in.DelayMs
 		if delay <= 0 {
 			delay = 12
@@ -1874,6 +2003,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "key_press", Title: "Key Press", Description: "Send a key or key combo using xdotool key syntax, e.g. 'Return', 'ctrl+c', 'alt+Tab', 'super'."}, func(ctx context.Context, _ *mcp.CallToolRequest, in KeyPressInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("key_press"); unsupported {
+			return textResult(msg)
+		}
 		if isDarwin {
 			if err := macPressKeys(ctx, in.Keys); err != nil {
 				return textResult(fmt.Sprintf("key_press_error: %v", err))
@@ -1888,6 +2020,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "get_active_window", Title: "Get Active Window", Description: "Return the id, title, and window class of the currently focused window."}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("get_active_window"); unsupported {
+			return textResult(msg)
+		}
 		if isDarwin {
 			return textResult(macActiveWindow(ctx))
 		}
@@ -1902,6 +2037,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "list_windows", Title: "List Windows", Description: "List visible windows with their id and title."}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("list_windows"); unsupported {
+			return textResult(msg)
+		}
 		if isDarwin {
 			return textResult(macListWindows(ctx))
 		}
@@ -1925,6 +2063,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "notify_send", Title: "Send Notification", Description: "Show a desktop notification popup."}, func(ctx context.Context, _ *mcp.CallToolRequest, in NotifyInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("notify_send"); unsupported {
+			return textResult(msg)
+		}
 		if isDarwin {
 			if out, err := macNotify(ctx, in.Title, in.Body); err != nil {
 				return textResult(fmt.Sprintf("notify_error: %v\n%s", err, string(out)))
@@ -1947,6 +2088,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "ocr_screenshot", Title: "OCR Screenshot", Description: "Capture the screen (or a specific window) and run OCR to extract any visible text."}, func(ctx context.Context, _ *mcp.CallToolRequest, in OCRInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("ocr_screenshot"); unsupported {
+			return textResult(msg)
+		}
 		tmpImg, err := os.CreateTemp("", "ryns-ocr-*.png")
 		if err != nil {
 			return toolError("ocr_error", err)
@@ -1978,6 +2122,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "camera_capture", Title: "Camera Capture", Description: "Capture a single JPEG photo from the webcam and return it inline. Optionally also saves a copy to disk."}, func(ctx context.Context, _ *mcp.CallToolRequest, in CameraInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("camera_capture"); unsupported {
+			return textResult(msg)
+		}
 		if isDarwin {
 			return textResult("camera_error: belum didukung di macOS (butuh ffmpeg avfoundation); saat ini khusus Linux")
 		}
@@ -1996,6 +2143,7 @@ func setupTools(server *mcp.Server) {
 		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(cctx, "ffmpeg", "-y", "-f", "v4l2", "-input_format", "mjpeg", "-video_size", "1280x720", "-i", device, "-frames:v", "1", "-update", "1", tmpPath)
+		cmd.Env = childEnv()
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return textResult(fmt.Sprintf("camera_error: %v\n%s", err, string(out)))
@@ -2032,6 +2180,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "record_video", Title: "Record Video", Description: "Record the screen or the webcam for a set number of seconds (max 120), save it as an MP4 under the public assets/ folder, and return its public URL — no video bytes are sent back through the tool result, just the link."}, func(ctx context.Context, _ *mcp.CallToolRequest, in RecordInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("record_video"); unsupported {
+			return textResult(msg)
+		}
 		if isDarwin {
 			return textResult("record_error: belum didukung di macOS (butuh ffmpeg avfoundation); saat ini khusus Linux")
 		}
@@ -2074,6 +2225,7 @@ func setupTools(server *mcp.Server) {
 				device = "/dev/video0"
 			}
 			cmd = exec.CommandContext(cctx, "ffmpeg", "-y", "-f", "v4l2", "-input_format", "mjpeg", "-video_size", "1280x720", "-framerate", "30", "-i", device, "-t", strconv.Itoa(secs), "-pix_fmt", "yuv420p", "-vcodec", "libx264", "-preset", "veryfast", outPath)
+			cmd.Env = childEnv()
 		}
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -2552,6 +2704,9 @@ func setupTools(server *mcp.Server) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{OutputSchema: toolOutputSchema, Name: "system_stats", Title: "System Stats", Description: "Show a snapshot of the machine's health: CPU core count and load average, RAM and swap usage, root disk usage, battery status/health, and temperatures when available."}, func(ctx context.Context, _ *mcp.CallToolRequest, _ SystemStatsInput) (*mcp.CallToolResult, any, error) {
+		if unsupported, msg := windowsUnsupported("system_stats"); unsupported {
+			return textResult(msg)
+		}
 		if isDarwin {
 			return textResult(darwinSystemStats(ctx))
 		}
@@ -2704,6 +2859,7 @@ func registerGit(server *mcp.Server, name string, args []string, description str
 		}
 		cmd := exec.CommandContext(ctx, "git", args...)
 		cmd.Dir = cwd
+		cmd.Env = childEnv()
 		out, e := cmd.CombinedOutput()
 		if e != nil {
 			return textResult("git_error: " + string(out))
